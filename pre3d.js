@@ -323,6 +323,20 @@ Pre3d = (function() {
       0
     );
   }
+  
+  function makeAxisAngleRotationAffine(e, t) {
+	  // I cos t + I (1 - cos t)ee^t + [e]_x sin t
+	  var cost = Math.cos(t);
+	  var sint = Math.sin(t);
+	  var m1cost = 1 - cost;
+	  var enorm = vecMag3d(e);
+	  
+	  return new AffineMatrix(
+		cost + m1cost * e.x * e.x, 	-e.z * sint, 				e.y * sint,					0,
+		e.z * sint,					cost + m1cost * e.y * e.y, 	-e.x * sint,				0,
+		-e.y * sint,				e.x * sint,					cost + m1cost * e.z * e.z,	0
+	  );
+  }
 
   // Transform the point |p| by the AffineMatrix |t|.
   function transformPoint(t, p) {
@@ -412,6 +426,17 @@ Pre3d = (function() {
     var tm = new Transform();
     tm.m = dupAffine(this.m);
     return tm;
+  };
+  
+  
+  function normalize(axis) {
+	  var scale = 1 / vecMag3d(axis);
+	  return { x: axis.x * scale, y: axis.y * scale, z: axis.z * scale };
+  }
+  
+  Transform.prototype.rotateAroundAxis = function(axis, angle) {
+	  var e = normalize(axis);
+	  this.m = multiplyAffine(this.m, makeAxisAngleRotationAffine(e, angle));
   };
 
   // Transform and return a new array of points with transform matrix |t|.
@@ -514,6 +539,7 @@ Pre3d = (function() {
     this.i3 = null;
   };
 
+  var TRANSPARENT = new RGBA(1, 1, 1, 0);
   // A Shape represents a mesh, a collection of QuadFaces.  The Shape stores
   // a list of all vertices (so they can be shared across QuadFaces), and the
   // QuadFaces store indices into this list.
@@ -524,6 +550,8 @@ Pre3d = (function() {
     this.vertices = [ ];
     // Array of QuadFaces, the indices will point into |vertices|.
     this.quads = [ ];
+    this.fillColor = TRANSPARENT;
+    this.strokeColor = TRANSPARENT;
   }
 
   // A curve represents a bezier curve, either quadratic or cubic.  It is
@@ -699,6 +727,9 @@ Pre3d = (function() {
   // Takes the current focal_length_ in account.
   Renderer.prototype.projectPointToCanvas = function projectPointToCanvas(p) {
     // We're looking down the z-axis in the negative direction...
+	if (p.z > 0) {
+		return null;
+	}
     var v = this.camera.focal_length / -p.z;
     var scale = this.scale_;
     // Map the height to -1 .. 1, and the width to maintain aspect.
@@ -712,9 +743,72 @@ Pre3d = (function() {
   Renderer.prototype.projectPointsToCanvas =
       function projectPointsToCanvas(ps) {
     var il = ps.length;
+    var fl = this.camera.focal_length;
     var out = Array(il);
+    var scale = this.scale_;
+    var xoff = this.xoff_;
     for (var i = 0; i < il; ++i) {
-      out[i] = this.projectPointToCanvas(ps[i]);
+    	var p = ps[i];
+       	var v = fl / -p.z;
+	   	var vscale = v * scale;
+	   	out[i] = {x: p.x * vscale + xoff,
+	             y: p.y * -vscale + scale};
+    }
+    return out;
+  };
+  
+  /**
+   * Do pretty much the same as projectPointsToCanvas, except
+   * return null if one of the points is behind the camera. This
+   * should be used if the points are part of the same object.
+   * Ideally, one would compute the intersection of various objects with the
+   * camera (focal) plane...
+   */
+  Renderer.prototype.projectPointsToCanvas2 =
+      function projectPointsToCanvas2(ps) {
+    var il = ps.length;
+    var fl = this.camera.focal_length;
+    var out = Array(il);
+    var scale = this.scale_;
+    var xoff = this.xoff_;
+    for (var i = 0; i < il; ++i) {
+    	var p = ps[i];
+    	if (p.z < 0) {
+	    	var v = fl / -p.z;
+	    	var vscale = v * scale;
+	    	out[i] = {x: p.x * vscale + xoff,
+	              y: p.y * -vscale + scale};
+    	}
+    	else {
+    		return null;
+    	}
+    }
+    return out;
+  };
+  
+  /**
+   * Do pretty much the same as projectPointsToCanvas, except
+   * a null value is placed for each of the points behind the camera. This
+   * should be used when drawing independent points
+   */
+  Renderer.prototype.projectPointsToCanvas3 =
+      function projectPointsToCanvas3(ps) {
+    var il = ps.length;
+    var fl = this.camera.focal_length;
+    var out = Array(il);
+    var scale = this.scale_;
+    var xoff = this.xoff_;
+    for (var i = 0; i < il; ++i) {
+    	var p = ps[i];
+    	if (p.z < 0) {
+	    	var v = fl / -p.z;
+	    	var vscale = v * scale;
+	    	out[i] = {x: p.x * vscale + xoff,
+	              y: p.y * -vscale + scale};
+    	}
+    	else {
+    		out[i] = null;
+    	}
     }
     return out;
   };
@@ -798,7 +892,6 @@ Pre3d = (function() {
   // Put a shape into the draw buffer, transforming it by the current camera,
   // applying any current render state, etc.
   Renderer.prototype.bufferShape = function bufferShape(shape) {
-    var draw_backfaces = this.draw_backfaces;
     var quad_callback = this.quad_callback;
 
     // Our vertex transformation matrix.
@@ -814,6 +907,11 @@ Pre3d = (function() {
     // always calculate it and duplicate the work.  Not sure what's best...
     var world_vertices = transformPoints(t, shape.vertices);
     var quads = shape.quads;
+    
+    var al = this.ambientLight;
+    if (!al) {
+  	  	al = 0;
+    }
 
     for (var j = 0, jl = shape.quads.length; j < jl; ++j) {
       var qf = quads[j];
@@ -841,36 +939,26 @@ Pre3d = (function() {
       // this seems to look ok, following the eye from the origin.  We look
       // at the normals of the triangulated quad, and make sure at least one
       // is point towards the camera...
-      if (draw_backfaces !== true &&
+      if (shape.drawBackFaces === false &&
           dotProduct3d(centroid, n1) > 0 &&
           dotProduct3d(centroid, n2) > 0) {
         continue;
       }
-
-      // Lighting intensity is just based on just one of the normals pointing
-      // towards the camera.  Should do something better here someday...
-      var intensity = dotProduct3d(g_z_axis_vector, n1);
-      if (intensity < 0)
-        intensity = 0;
-
-      // We map the quad into world coordinates, and also replace the indices
-      // with the actual points.
-      var world_qf;
-
+      
+	  // Lighting intensity is just based on just one of the normals pointing
+	  // towards the camera.  Should do something better here someday...
+	  var intensity = dotProduct3d(g_z_axis_vector, n1);
+      if (intensity < 0) {
+    	// double sided materials
+    	intensity = -intensity;
+      }
+      intensity = intensity * (1 - al) + al;
+	
       if (qf.isTriangle() === true) {
-        world_qf = new QuadFace(
-          world_vertices[qf.i0],
-          world_vertices[qf.i1],
-          world_vertices[qf.i2],
-          null
-        );
-      } else {
-        world_qf = new QuadFace(
-          world_vertices[qf.i0],
-          world_vertices[qf.i1],
-          world_vertices[qf.i2],
-          world_vertices[qf.i3]
-        );
+        world_qf = new QuadFace(qf.i0, qf.i1, qf.i2, null);
+      } 
+      else {
+        world_qf = new QuadFace(qf.i0, qf.i1, qf.i2, qf.i3);
       }
 
       world_qf.centroid = centroid;
@@ -879,13 +967,13 @@ Pre3d = (function() {
 
       var obj = {
         qf: world_qf,
+        v: world_vertices,
+        lines: shape.lines,
         intensity: intensity,
         draw_overdraw: this.draw_overdraw,
         texture: this.texture,
-        fill_rgba: this.fill_rgba,
-        stroke_rgba: this.stroke_rgba,
-        normal1_rgba: this.normal1_rgba,
-        normal2_rgba: this.normal2_rgba,
+        fill_rgba: shape.fillColor,
+        stroke_rgba: shape.strokeColor,
       };
 
       this.buffered_quads_.push(obj);
@@ -906,6 +994,85 @@ Pre3d = (function() {
   Renderer.prototype.clearBackground = function() {
     this.ctx.clearRect(0, 0, this.width_, this.height_);
   };
+  
+  Renderer.prototype.createOffscreenBuffer = function() {
+	this.img = this.ctx.createImageData(this.width_, this.height_);
+	this.imgdata = this.img.data;
+  };
+  
+  Renderer.prototype.renderOffscreenBuffer = function() {
+	  this.ctx.putImageData(this.img, 0, 0);
+  };
+  
+  function get8BitStrokeColor(c) {
+	  return {r: Math.round(c.r * 255), g: Math.round(c.g * 255), b: Math.round(c.b * 255), a: Math.round(c.a * 255)};
+  }
+  
+  Renderer.prototype.iLine = function iLine(x1, y1, x2, y2, color) {
+	    var color = get8BitStrokeColor(color);
+	    var idata = this.imgdata;
+		var w4 = this.width_ * 4;
+		x1 = Math.round(x1);
+		x2 = Math.round(x2);
+		y1 = Math.round(y1);
+		y2 = Math.round(y2);
+	    var dx = x2 - x1; var sx = 1;
+	    var dy = y2 - y1; var sy = 1;
+	    var six = 4;
+	    var siy = w4;
+	    
+	    if (dx < 0) {
+	        sx = -1;
+	        six = -4;
+	        dx = -dx;
+	    }
+	    if (dy < 0) {
+	        sy = -1;
+	        siy = -w4;
+	        dy = -dy;
+	    }
+	    
+	    dx = dx << 1;
+	    dy = dy << 1;
+	    var ix = w4 * y1 + x1 * 4;
+	    idata[ix] = color.r;
+	    idata[ix+1] = color.g;
+	    idata[ix+2] = color.b;
+	    idata[ix+3] = color.a;
+	    
+	    if (dy < dx) {
+	        var fraction = dy - (dx>>1);
+	        while (x1 != x2) {
+	            if (fraction >= 0) {
+	                ix += siy;
+	                fraction -= dx;
+	            }
+	            fraction += dy;
+	            x1 += sx;
+	            ix += six;
+	            idata[ix] = color.r;
+	    	    idata[ix+1] = color.g;
+	    	    idata[ix+2] = color.b;
+	    	    idata[ix+3] = color.a;
+	        }
+	    } 
+	    else {
+	        var fraction = dx - (dy>>1);
+	        while (y1 != y2) {
+	            if (fraction >= 0) {
+	                ix += six;
+	                fraction -= dy;
+	            }
+	            fraction += dx;
+	            y1 += sy;
+	            ix += siy;
+	            idata[ix] = color.r;
+	    	    idata[ix+1] = color.g;
+	    	    idata[ix+2] = color.b;
+	    	    idata[ix+3] = color.a;
+	        }
+	    }
+	}
 
   Renderer.prototype.drawBuffer = function drawBuffer() {
     var ctx = this.ctx;
@@ -918,14 +1085,24 @@ Pre3d = (function() {
     // to paint the most negative z quads first.
     if (this.perform_z_sorting === true)
       all_quads.sort(zSorter);
+    
+    var csrgba = null;
 
     for (var j = 0; j < num_quads; ++j) {
       var obj = all_quads[j];
       var qf = obj.qf;
-
-      this.projectQuadFaceToCanvasIP(qf);
+      
+      var wv = this.projectPointsToCanvas(obj.v);
+      // why project the same vertice(s) multiple times?
+      //this.projectQuadFaceToCanvasIP(qf);
 
       var is_triangle = qf.isTriangle();
+      var wp0 = wv[qf.i0];
+      var wp1 = wv[qf.i1];
+      var wp2 = wv[qf.i2];
+      if (!is_triangle) {
+    	  var wp3 = wv[qf.i3];
+      }
 
       if (obj.draw_overdraw === true) {
         // Unfortunately when we fill with canvas, we can get some gap looking
@@ -937,23 +1114,23 @@ Pre3d = (function() {
         // Chrome doesn't support shadows correctly now.  It does in trunk, but
         // using shadows to fill the gaps looks awful, and also seems slower.
 
-        pushPoints2dIP(qf.i0, qf.i1);
-        pushPoints2dIP(qf.i1, qf.i2);
+        pushPoints2dIP(wp0, wp1);
+        pushPoints2dIP(wp1, wp2);
         if (is_triangle === true) {
-          pushPoints2dIP(qf.i2, qf.i0);
+          pushPoints2dIP(wp2, wp0);
         } else {  // Quad.
-          pushPoints2dIP(qf.i2, qf.i3);
-          pushPoints2dIP(qf.i3, qf.i0);
+          pushPoints2dIP(wp2, wp3);
+          pushPoints2dIP(wp3, wp0);
         }
       }
 
       // Create our quad as a <canvas> path.
       ctx.beginPath();
-      ctx.moveTo(qf.i0.x, qf.i0.y);
-      ctx.lineTo(qf.i1.x, qf.i1.y);
-      ctx.lineTo(qf.i2.x, qf.i2.y);
+      ctx.moveTo(wp0.x, wp0.y);
+      ctx.lineTo(wp1.x, wp1.y);
+      ctx.lineTo(wp2.x, wp2.y);
       if (is_triangle !== true)
-        ctx.lineTo(qf.i3.x, qf.i3.y);
+        ctx.lineTo(wp3.x, wp3.y);
       // Don't bother closing it unless we need to.
 
       // Fill...
@@ -965,56 +1142,52 @@ Pre3d = (function() {
       }
 
       // Texturing...
-      var texture = obj.texture;
-      if (texture !== null) {
+      /*if (obj.texture !== null) {
+    	var texture = obj.texture;
         drawCanvasTexturedTriangle(ctx, texture.image,
-          qf.i0.x, qf.i0.y, qf.i1.x, qf.i1.y, qf.i2.x, qf.i2.y,
-          texture.u0, texture.v0, texture.u1, texture.v1,
-          texture.u2, texture.v2);
+        	wp0.x, wp0.y, wp1.x, wp1.y, wp2.x, wp2.y,
+        	texture.u0, texture.v0, texture.u1, texture.v1,
+        	texture.u2, texture.v2);
         if (!is_triangle) {
           drawCanvasTexturedTriangle(ctx, texture.image,
-            qf.i0.x, qf.i0.y, qf.i2.x, qf.i2.y, qf.i3.x, qf.i3.y,
+        	wp0.x, wp0.y, wp2.x, wp2.y, wp3.x, wp3.y,
             texture.u0, texture.v0, texture.u2, texture.v2,
             texture.u3, texture.v3);
         }
-      }
+      }*/
 
       // Stroke...
       var srgba = obj.stroke_rgba;
       if (srgba !== null) {
-        ctx.closePath();
-        ctx.setStrokeColor(srgba.r, srgba.g, srgba.b, srgba.a);
-        ctx.stroke();
-      }
-
-      // Normal lines (stroke)...
-      var n1r = obj.normal1_rgba;
-      var n2r = obj.normal2_rgba;
-      if (n1r !== null) {
-        ctx.setStrokeColor(n1r.r, n1r.g, n1r.b, n1r.a);
-        var screen_centroid = this.projectPointToCanvas(qf.centroid);
-        var screen_point = this.projectPointToCanvas(
-            addPoints3d(qf.centroid, unitVector3d(qf.normal1)));
-        ctx.beginPath();
-        ctx.moveTo(screen_centroid.x, screen_centroid.y);
-        ctx.lineTo(screen_point.x, screen_point.y);
-        ctx.stroke();
-      }
-      if (n2r !== null) {
-        ctx.setStrokeColor(n2r.r, n2r.g, n2r.b, n2r.a);
-        var screen_centroid = this.projectPointToCanvas(qf.centroid);
-        var screen_point = this.projectPointToCanvas(
-            addPoints3d(qf.centroid, unitVector3d(qf.normal2)));
-        ctx.beginPath();
-        ctx.moveTo(screen_centroid.x, screen_centroid.y);
-        ctx.lineTo(screen_point.x, screen_point.y);
-        ctx.stroke();
+    	ctx.closePath();
+   		ctx.setStrokeColor(srgba.r, srgba.g, srgba.b, srgba.a);
+        if (obj.lines != null) {
+        	ctx.beginPath();
+			var vlines = obj.lines;
+			 
+			for (var k = 0; k < vlines.length; k++) {
+				var line = vlines[k];
+				var p1 = wv[line.v1];
+				var p2 = wv[line.v2];
+				if (p1 === null || p2 === null) {
+					continue;
+				}
+				ctx.moveTo(p1.x, p1.y);
+				ctx.lineTo(p2.x, p2.y);
+				//this.iLine(p1.x, p1.y, p2.x, p2.y, srgba);
+			}
+			ctx.stroke();
+		}
+        else {
+        	ctx.stroke();
+        }
       }
     }
 
     return num_quads;
   }
 
+  
   // Draw a Path.  There is no buffering, because there is no culling or
   // z-sorting.  There is currently no filling, paths are only stroked.  To
   // control the render state, you should modify ctx directly, and set whatever
@@ -1023,16 +1196,14 @@ Pre3d = (function() {
     var ctx = this.ctx;
     var opts = opts || { };
 
-    var t = multiplyAffine(this.camera.transform.m,
-                           this.transform.m);
-
     var screen_points = this.projectPointsToCanvas(
-        transformPoints(t, path.points));
+        transformPoints(this.precomputedTransform, path.points));
 
     // Start the path at (0, 0, 0) unless there is an explicit starting point.
     var start_point = (path.starting_point === null ?
         this.projectPointToCanvas(transformPoint(t, {x: 0, y: 0, z: 0})) :
         screen_points[path.starting_point]);
+    
 
     ctx.beginPath();
     ctx.moveTo(start_point.x, start_point.y);
@@ -1060,6 +1231,273 @@ Pre3d = (function() {
       ctx.stroke();
     }
   };
+  
+  Renderer.prototype.drawCurve = function drawCurve(c) {
+	  var ctx = this.ctx;
+
+	  var p1 = this.projectPointToCanvas(
+		        transformPoint(this.precomputedTransform, c.p1));
+	  var p2 = this.projectPointToCanvas(
+		        transformPoint(this.precomputedTransform, c.p2));
+	  var d1 = this.projectPointToCanvas(
+		        transformPoint(this.precomputedTransform, c.d1));
+	  var d2 = this.projectPointToCanvas(
+		        transformPoint(this.precomputedTransform, c.d2));
+	  if (p1 === null || p2 === null || d1 === null || d2 === null) {
+		  return;
+	  }
+	  
+	  ctx.beginPath();
+	  ctx.moveTo(p1.x, p1.y);
+	  ctx.bezierCurveTo(d1.x, d1.y, d2.x, d2.y, p2.x, p2.y);
+	  square(ctx, p1);
+	  square(ctx, p2);
+	  ctx.stroke();
+  }
+  
+  function cross(ctx, sp) {
+	  ctx.moveTo(sp.x - 4, sp.y);
+	  ctx.lineTo(sp.x + 4, sp.y);
+	  ctx.moveTo(sp.x, sp.y - 4);
+	  ctx.lineTo(sp.x, sp.y + 4);
+  }
+  
+  function square(ctx, sp) {
+	  ctx.moveTo(sp.x - 2, sp.y - 2);
+	  ctx.lineTo(sp.x + 2, sp.y - 2);
+	  ctx.lineTo(sp.x + 2, sp.y + 2);
+	  ctx.lineTo(sp.x - 2, sp.y + 2);
+	  ctx.lineTo(sp.x - 2, sp.y - 2);
+  }
+  
+  Renderer.prototype.drawRect = function drawRect(vs) {
+	  var ctx = this.ctx;
+	  var vpt = this.projectPointsToCanvas(transformPoints(this.precomputedTransform, vs));
+	  
+	  ctx.beginPath();
+	  ctx.moveTo(vpt[0].x, vpt[0].y);
+	  ctx.lineTo(vpt[1].x, vpt[1].y);
+	  ctx.lineTo(vpt[2].x, vpt[2].y);
+	  ctx.lineTo(vpt[3].x, vpt[3].y);
+	  ctx.lineTo(vpt[0].x, vpt[0].y);
+	  ctx.stroke();
+  };
+  
+  Renderer.prototype.drawLine = function drawLine(start, end) {
+	    var ctx = this.ctx;
+
+	    var sp = this.projectPointToCanvas(
+	        transformPoint(this.precomputedTransform, start));
+	    var ep = this.projectPointToCanvas(
+		        transformPoint(this.precomputedTransform, end));
+	    if (sp === null || ep === null) {
+	    	return;
+	    }
+
+	    ctx.beginPath();
+	    ctx.moveTo(sp.x, sp.y);
+    	ctx.lineTo(ep.x, ep.y);
+    	ctx.stroke();
+	  };
+	  
+	  Renderer.prototype.drawLineWithCaps = function drawLineWithCaps(start, end, caps) {
+		    var ctx = this.ctx;
+		    var sp = this.projectPointToCanvas(
+		        transformPoint(this.precomputedTransform, start));
+		    var ep = this.projectPointToCanvas(
+			        transformPoint(this.precomputedTransform, end));
+		    if (sp === null || ep === null) {
+		    	return;
+		    }
+
+		    ctx.beginPath();
+		    ctx.moveTo(sp.x, sp.y);
+	    	ctx.lineTo(ep.x, ep.y);
+	    	if (caps == "+") {
+	    		ctx.moveTo(sp.x - 2, sp.y);
+	    		ctx.lineTo(sp.x + 2, sp.y);
+	    		ctx.moveTo(sp.x, sp.y - 2);
+	    		ctx.lineTo(sp.x, sp.y + 2);
+	    		ctx.moveTo(ep.x - 2, ep.y);
+	    		ctx.lineTo(ep.x + 2, ep.y);
+	    		ctx.moveTo(ep.x, ep.y - 2);
+	    		ctx.lineTo(ep.x, ep.y + 2);
+	    	}
+	    	else if (caps == "square") {
+	    		ctx.moveTo(sp.x - 2, sp.y - 2);
+	    		ctx.lineTo(sp.x + 2, sp.y - 2);
+	    		ctx.lineTo(sp.x + 2, sp.y + 2);
+	    		ctx.lineTo(sp.x - 2, sp.y + 2);
+	    		ctx.lineTo(sp.x - 2, sp.y - 2);
+	    		ctx.moveTo(ep.x - 2, ep.y - 2);
+	    		ctx.lineTo(ep.x + 2, ep.y - 2);
+	    		ctx.lineTo(ep.x + 2, ep.y + 2);
+	    		ctx.lineTo(ep.x - 2, ep.y + 2);
+	    		ctx.lineTo(ep.x - 2, ep.y - 2);
+	    	}
+	    	ctx.stroke();
+		  };
+	  
+	  Renderer.prototype.drawLines = function drawLines(lines) {
+		    var ctx = this.ctx;
+		    var pt = this.precomputedTransform;
+
+		    ctx.beginPath();
+		    for (var i = 0; i < lines.length; i++) {
+		    	var sp = this.projectPointToCanvas(transformPoint(pt, lines[i].p1));
+		    	var ep = this.projectPointToCanvas(transformPoint(pt, lines[i].p2));
+		    	if (sp === null || ep === null) {
+			    	continue;
+			    }
+		    	ctx.moveTo(sp.x, sp.y);
+		    	ctx.lineTo(ep.x, ep.y);
+		    }
+		    ctx.stroke();
+		  };
+		  
+	Renderer.prototype.drawLines2 = function drawLines2(spa, epa) {
+			    var ctx = this.ctx;
+			    var pt = this.precomputedTransform;
+			    var sp = this.projectPointsToCanvas(transformPoints(pt, spa));
+			    var ep = this.projectPointsToCanvas(transformPoints(pt, epa));
+			    if (sp === null || ep === null) {
+			    	return;
+			    }
+
+			    ctx.beginPath();
+			    for (var i = 0; i < sp.length; i++) {
+			    	ctx.moveTo(sp[i].x, sp[i].y);
+			    	ctx.lineTo(ep[i].x, ep[i].y);
+			    }
+			    ctx.stroke();
+			  };
+	  
+  Renderer.prototype.precomputeTransform = function precomputeTransform() {
+	  this.precomputedTransform = multiplyAffine(this.camera.transform.m,
+              this.transform.m);
+  }
+  
+  Renderer.prototype.drawPoint = function drawPoint(p3d, shape) {
+	    var ctx = this.ctx;
+
+	    var sp = this.projectPointToCanvas(
+	        transformPoint(this.precomputedTransform, p3d));
+	    
+	    if (sp === null) {
+	    	return;
+	    }
+
+	    ctx.beginPath();
+	    if (shape == "x") {
+	    	ctx.moveTo(sp.x - 3, sp.y - 3);
+	    	ctx.lineTo(sp.x + 3, sp.y + 3);
+	    	ctx.moveTo(sp.x - 3, sp.y + 3);
+	    	ctx.lineTo(sp.x + 3, sp.y - 3);
+	    	ctx.stroke();
+	    }
+	    else if (shape == "+") {
+	    	ctx.moveTo(sp.x - 3, sp.y);
+	    	ctx.lineTo(sp.x + 6, sp.y);
+	    	ctx.moveTo(sp.x, sp.y + 3);
+	    	ctx.lineTo(sp.x, sp.y - 3);
+	    	ctx.stroke();
+	    }
+	    else if (shape == "square") {
+	    	ctx.moveTo(sp.x - 3, sp.y - 3);
+	    	ctx.lineTo(sp.x + 3, sp.y - 3);
+	    	ctx.lineTo(sp.x + 3, sp.y + 3);
+	    	ctx.lineTo(sp.x - 3, sp.y + 3);
+	    	ctx.lineTo(sp.x - 3, sp.y - 3);
+	    	ctx.stroke();
+	    }
+	    else if (shape == "circle" || shape == "disc") {
+	    	ctx.arc(sp.x, sp.y, 3, 0, 360, false);
+	    	if (shape == "circle") {
+	    		ctx.stroke();
+	    	}
+	    	else {
+	    		ctx.fill();
+	    	}
+	    }
+	  };
+	  
+	  Renderer.prototype.drawText = function drawText(p3d, text) {
+		    var ctx = this.ctx;
+
+		    var sp = this.projectPointToCanvas(
+		        transformPoint(this.precomputedTransform, p3d));
+		    
+		    ctx.fillText(text, sp.x, sp.y);
+		  };
+	  
+	  Renderer.prototype.drawPoints = function drawPoints(p3da, shape, start, end) {
+		    var ctx = this.ctx;
+		    if (start == null) {
+		    	start = 0;
+		    }
+		    if (end == null) {
+		    	end = p3da.length;
+		    }
+
+		    var spa = this.projectPointsToCanvas3(
+		        transformPoints(this.precomputedTransform, p3da));
+
+		    if (shape == "x") {
+		    	ctx.beginPath();
+		    	for (var i = start; i < end; i++) {
+		    		var sp = spa[i];
+		    		if (sp === null) {
+		    			continue;
+		    		}
+		    		ctx.moveTo(sp.x - 3, sp.y - 3);
+		    		ctx.lineTo(sp.x + 3, sp.y + 3);
+		    		ctx.moveTo(sp.x - 3, sp.y + 3);
+		    		ctx.lineTo(sp.x + 3, sp.y - 3);
+		    	}
+		    	var sc = this.strokeColor;
+		    	ctx.stroke();
+		    }
+		    else if (shape == "+") {
+		    	ctx.beginPath();
+		    	for (var i = start; i < end; i++) {
+		    		var sp = spa[i];
+		    		if (sp === null) {
+		    			continue;
+		    		}
+			    	ctx.moveTo(sp.x - 3, sp.y);
+			    	ctx.lineTo(sp.x + 6, sp.y);
+			    	ctx.moveTo(sp.x, sp.y + 3);
+			    	ctx.lineTo(sp.x, sp.y - 3);
+		    	}
+		    	ctx.stroke();
+		    }
+		    else if (shape == "square") {
+		    	for (var i = start; i < end; i++) {
+		    		var sp = spa[i];
+		    		if (sp === null) {
+		    			continue;
+		    		}
+		    		ctx.strokeRect(sp.x - 3, sp.y - 3, 6, 6);
+		    	}
+		    }
+		    else if (shape == "circle" || shape == "disc") {
+		    	for (var i = start; i < end; i++) {
+		    		var sp = spa[i];
+		    		if (sp === null) {
+		    			continue;
+		    		}
+		    		ctx.beginPath();
+		    		ctx.arc(sp.x, sp.y, 3, 0, 360, false);
+			    	if (shape == "circle") {
+			    		ctx.stroke();
+			    	}
+			    	else {
+			    		ctx.fill();
+			    	}
+		    	}
+		    }
+	  };
+
 
   return {
     RGBA: RGBA,
@@ -1089,6 +1527,8 @@ Pre3d = (function() {
       linearInterpolate: linearInterpolate,
       linearInterpolatePoints3d: linearInterpolatePoints3d,
       averagePoints: averagePoints,
+      normalize: normalize,
     },
   };
 })();
+
